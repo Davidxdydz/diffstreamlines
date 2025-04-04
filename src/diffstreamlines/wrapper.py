@@ -14,27 +14,29 @@ class Streamlines(Function):
         dt: float,
         steps: int,
     ) -> torch.Tensor:
-        ctx.save_for_backward(velocities, start_positions)
         ctx.dt = dt
-        ctx.steps = steps
+        ctx.width = velocities.shape[1]
+        ctx.height = velocities.shape[0]
         paths, path_lengths = _C.streamlines_forward(
             velocities,
             start_positions,
             dt,
             steps,
         )
+        ctx.save_for_backward(paths, path_lengths)
         return paths, path_lengths
 
     @staticmethod
     def backward(ctx: FunctionCtx, grad_output: torch.Tensor, *args):
         # TODO why tf do i get args here
-        velocities, start_positions = ctx.saved_tensors
+        paths, path_lengths = ctx.saved_tensors
         velocities_grad = _C.streamlines_backward(
             grad_output,
-            velocities,
-            start_positions,
+            paths,
+            path_lengths,
+            ctx.width,
+            ctx.height,
             ctx.dt,
-            ctx.steps,
         )
         return velocities_grad, None, None, None
 

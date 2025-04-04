@@ -91,61 +91,46 @@ std::tuple<torch::Tensor, torch::Tensor> streamlines_forward(torch::Tensor veloc
 }
 
 __global__ void streamlines_kernel_backward(
-    const float *__restrict__ velocity,
-    const float *__restrict__ start_locations,
+    const float *__restrict__ paths,
+    const int *__restrict__ path_lengths,
     const float *__restrict__ grad_output,
     float *__restrict__ grad_velocity,
-    int steps,
     int height,
-    int width, int n, float dt)
+    int width, int n, float dt, int steps)
 {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= n)
         return;
-    float2 pos = {
-        start_locations[id * 2],
-        start_locations[id * 2 + 1]};
-    // grad_velocity[grid_index(pos, width)] = grad_output[id * (steps + 1) * 2];
-    // grad_velocity[grid_index(pos, width) + 1] = grad_output[id * (steps + 1) * 2 + 1];
-    atomicAdd(&grad_velocity[grid_index(pos, width)], grad_output[id * (steps + 1) * 2]);
-    atomicAdd(&grad_velocity[grid_index(pos, width) + 1], grad_output[id * (steps + 1) * 2 + 1]);
-    for (int i = 0; i < steps; i++)
+    for (int i = 0; i < path_lengths[id]; i++)
     {
-        if (pos.x < 0 || pos.x >= width || pos.y < 0 || pos.y >= height)
-        {
-            return;
-        }
-        float2 v = velocity_at_point(velocity, pos, width);
-        pos.x += v.x * dt;
-        pos.y += v.y * dt;
-        // grad_velocity[grid_index(pos, width)] += grad_output[id * (steps + 1) * 2 + i * 2 + 2] * dt;
-        // grad_velocity[grid_index(pos, width) + 1] += grad_output[id * (steps + 1) * 2 + i * 2 + 1 + 2] * dt;
-        atomicAdd(&grad_velocity[grid_index(pos, width)], grad_output[id * (steps + 1) * 2 + i * 2 + 2] * dt);
-        atomicAdd(&grad_velocity[grid_index(pos, width) + 1], grad_output[id * (steps + 1) * 2 + i * 2 + 1 + 2] * dt);
+        float2 pos = {
+            paths[id * (steps + 1) * 2 + i * 2],
+            paths[id * (steps + 1) * 2 + i * 2 + 1]};
+        atomicAdd(&grad_velocity[grid_index(pos, width)], grad_output[id * (steps + 1) * 2 + i * 2]);
+        atomicAdd(&grad_velocity[grid_index(pos, width) + 1], grad_output[id * (steps + 1) * 2 + i * 2 + 1]);
     }
 }
 
-torch::Tensor streamlines_backward(torch::Tensor grad_output, torch::Tensor velocity, torch::Tensor start_locations, float dt, int steps)
+torch::Tensor streamlines_backward(torch::Tensor grad_output, torch::Tensor paths, torch::Tensor paths_lengths, int width, int height, float dt)
 {
-    int n = start_locations.size(0);
-    int height = velocity.size(0);
-    int width = velocity.size(1);
+    int n = paths.size(0);
+    int steps = paths.size(1) - 1;
 
-    velocity = velocity.contiguous();
-    start_locations = start_locations.contiguous();
-    auto grad_velocity = torch::zeros_like(velocity);
+    paths = paths.contiguous();
+    paths_lengths = paths_lengths.contiguous();
+    auto grad_velocity = torch::zeros({height, width, 2}, grad_output.options());
     const dim3 threads(256);
     const dim3 blocks((n + threads.x - 1) / threads.x);
     streamlines_kernel_backward<<<blocks, threads>>>(
-        velocity.const_data_ptr<float>(),
-        start_locations.const_data_ptr<float>(),
+        paths.const_data_ptr<float>(),
+        paths_lengths.const_data_ptr<int>(),
         grad_output.const_data_ptr<float>(),
         grad_velocity.mutable_data_ptr<float>(),
-        steps,
         height,
         width,
         n,
-        dt);
+        dt,
+        steps);
     return grad_velocity;
 }
 
