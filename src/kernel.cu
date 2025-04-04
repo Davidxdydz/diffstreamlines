@@ -134,8 +134,120 @@ torch::Tensor streamlines_backward(torch::Tensor grad_output, torch::Tensor path
     return grad_velocity;
 }
 
+__device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
+{
+    // https://stackoverflow.com/questions/17399119/how-do-i-use-atomicmax-on-floating-point-values-in-cuda
+    float old;
+    old = (value >= 0) ? __int_as_float(atomicMax((int *)addr, __float_as_int(value))) : __uint_as_float(atomicMin((unsigned int *)addr, __float_as_uint(value)));
+
+    return old;
+}
+
+__global__ void render_streamlines_kernel_forward(float *__restrict__ image, int *__restrict__ drawn_indices, const float *__restrict__ paths, const int *__restrict__ path_lengths, int n, int steps, int width, int height, const int box_radius)
+{
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n)
+        return;
+    for (int i = 0; i < path_lengths[id]; i++)
+    {
+        int path_offset = id * (steps + 1) * 2;
+        float2 pos = {
+            paths[path_offset + i * 2],
+            paths[path_offset + i * 2 + 1]};
+        int2 gp = grid_pos(pos, width);
+        for (int iy = gp.y - box_radius; iy <= gp.y + box_radius; iy++)
+        {
+            for (int ix = gp.x - box_radius; ix <= gp.x + box_radius; ix++)
+            {
+                if (ix < 0 || ix >= width || iy < 0 || iy >= height)
+                    continue;
+                float cx = (float)ix + 0.5 - pos.x;
+                float cy = (float)iy + 0.5 - pos.y;
+                float dist2 = (cx * cx + cy * cy);
+                int index = (iy * width + ix);
+                float value = exp(-0.5 * dist2 / (box_radius * box_radius));
+                // max does not differentiate well, but this makes the gradient only depend on one path element
+                float old = atomicMaxFloat(&image[index], value);
+                // uh oh this is a race condition, lets see if it works
+                if (value > old)
+                {
+                    drawn_indices[index] = id;
+                }
+            }
+        }
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> render_streamlines_forward(torch::Tensor paths, torch::Tensor path_lenghts, int width, int height, const int box_radius)
+{
+    // TODO each point could be rendered in parallel, probably way faster for larger box_radius or larger n
+    auto n = paths.size(0);
+    int steps = paths.size(1);
+    auto image = torch::zeros({height, width}, paths.options());
+    auto drawn_indices = torch::full({height, width}, -1, torch::dtype(torch::kInt32).device(paths.device()));
+    paths = paths.contiguous();
+    path_lenghts = path_lenghts.contiguous();
+    const dim3 threads(256);
+    const dim3 blocks((n + threads.x - 1) / threads.x);
+    render_streamlines_kernel_forward<<<blocks, threads>>>(
+        image.mutable_data_ptr<float>(),
+        drawn_indices.mutable_data_ptr<int>(),
+        paths.const_data_ptr<float>(),
+        path_lenghts.const_data_ptr<int>(),
+        n,
+        steps,
+        width,
+        height,
+        box_radius);
+    return {image, drawn_indices};
+}
+
+__global__ void render_streamlines_kernel_backward(float *__restrict__ paths_grad, const float *__restrict__ grad_output, const int *__restrict__ drawn_indices, const float *__restrict__ paths, int width, int height, const int box_radius)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ix >= width || iy >= height)
+        return;
+    int index = (iy * width + ix);
+    int path_id = drawn_indices[index];
+    if (path_id == -1)
+        return;
+    float2 pos = {
+        paths[path_id],
+        paths[path_id + 1]};
+    int2 gp = grid_pos(pos, width);
+    float cx = (float)ix + 0.5 - pos.x;
+    float cy = (float)iy + 0.5 - pos.y;
+    float dist2 = (cx * cx + cy * cy);
+    float b2 = box_radius * box_radius;
+    float value = exp(-0.5 * dist2 / b2);
+    float grad = 2 * sqrt(dist2) / b2 * value * 2;
+    atomicAdd(&paths_grad[path_id], grad * grad_output[index] * cx);
+    atomicAdd(&paths_grad[path_id + 1], grad * grad_output[index] * cy);
+}
+
+torch::Tensor render_streamlines_backward(torch::Tensor grad_output, torch::Tensor paths, torch::Tensor drawn_indices, int width, int height, const int box_radius)
+{
+    auto paths_grad = torch::zeros_like(paths);
+    paths = paths.contiguous();
+    drawn_indices = drawn_indices.contiguous();
+    const dim3 threads(16, 16);
+    const dim3 blocks((width + threads.x - 1) / threads.x, (height + threads.y - 1) / threads.y);
+    render_streamlines_kernel_backward<<<blocks, threads>>>(
+        paths_grad.mutable_data_ptr<float>(),
+        grad_output.const_data_ptr<float>(),
+        drawn_indices.const_data_ptr<int>(),
+        paths.const_data_ptr<float>(),
+        width,
+        height,
+        box_radius);
+    return paths_grad;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("streamlines_forward", &streamlines_forward);
     m.def("streamlines_backward", &streamlines_backward);
+    m.def("render_streamlines_forward", &render_streamlines_forward);
+    m.def("render_streamlines_backward", &render_streamlines_backward);
 }

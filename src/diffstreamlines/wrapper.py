@@ -63,3 +63,51 @@ def streamlines(
         dt,
         steps,
     )
+
+
+class StreamlinesRenderer(Function):
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        paths: torch.Tensor,
+        path_lengths: torch.Tensor,
+        width: int,
+        height: int,
+        box_radius: int,
+    ):
+        image, drawn_indices = _C.render_streamlines_forward(
+            paths,
+            path_lengths,
+            width,
+            height,
+            box_radius,
+        )
+        ctx.save_for_backward(paths, drawn_indices)
+        ctx.width = width
+        ctx.height = height
+        ctx.box_radius = box_radius
+        return image
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, grad_output: torch.Tensor):
+        paths, drawn_indices = ctx.saved_tensors
+        paths_grad = _C.render_streamlines_backward(
+            grad_output,
+            paths,
+            drawn_indices,
+            ctx.width,
+            ctx.height,
+            ctx.box_radius,
+        )
+        return paths_grad, None, None, None, None
+
+
+def render_streamlines(paths, path_lengths, width, height, box_radius=1):
+    assert paths.is_cuda, "paths must be on GPU"
+    assert path_lengths.is_cuda, "path_lengths must be on GPU"
+    assert paths.dtype == torch.float32, "paths must be float32"
+    assert path_lengths.dtype == torch.int32, "path_lengths must be int32"
+    assert len(paths) == len(
+        path_lengths
+    ), "paths and path_lengths must have the same length"
+    return StreamlinesRenderer.apply(paths, path_lengths, width, height, box_radius)
